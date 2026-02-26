@@ -494,4 +494,4 @@ MIT
 
 ## Contributing
 
-Pull requests welcome! Please ensure all tests pass and update documentation.
+Pull requests welcome.
