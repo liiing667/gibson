@@ -195,6 +195,50 @@ cargo run --release -- parse \
 
 ## Web Server Setup for Data Collection
 
+### Upload validation and quarantine
+
+Being valid JSON is necessary but not sufficient: every record in a
+`POST /upload` batch passes a semantic gate **before** it is appended to a
+session. A record is rejected when any of the following hold:
+
+- `remote_ip` / `local_addr` is not a bare, parseable IP address (hostnames
+  smuggled into the IP field are rejected)
+- the local and remote addresses disagree on IPv4 vs IPv6 family
+- `remote_port` is missing or `0`; `local_port == 0` when present
+- `pid == 0`, `process_name` is empty, or `protocol` is not `TCP`/`UDP`
+  (case-insensitive)
+- `remote_addr` is not an `ip:port` endpoint or contradicts `remote_ip` /
+  `remote_port` (bracketed `[v6]:port` form supported)
+- `remote_hostname` is present but an empty string — use `null` when absent
+
+Legitimately empty optional fields (`local_port`, `remote_hostname`, `state`,
+`ppid`, `command_line`) remain `null` and are always accepted, as are both
+IPv4 and IPv6 records. Rejected records never enter a session — so they
+cannot distort cloud attribution, beaconing, port-anomaly or high-frequency
+talker reports — and are instead retained for audit:
+
+```bash
+curl -H "X-API-Key: $KEY" http://collector:8080/api/quarantine
+```
+
+The upload response reports both counts and per-record reasons, and a batch
+whose records are all rejected creates no session (`session_id` is `null`):
+
+```json
+{
+  "session_id": "host-a-1732406400",
+  "records_accepted": 4,
+  "records_rejected": 8,
+  "rejections": [
+    { "index": 4, "reason": "remote_ip \"999.1.2.3\" is not a valid IP address" }
+  ],
+  "total_for_machine": 4
+}
+```
+
+The offline `parse` command applies the same common-field rules to JSONL
+input and prints how many lines were skipped.
+
 ### Option 1: Simple Python Flask Server
 
 Create `collector_server.py`:

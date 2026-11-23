@@ -9,6 +9,7 @@ use tokio::task::JoinSet;
 
 use crate::asn_db::AsnDb;
 use crate::cloud_detector::{lookup_arin, ArinResult, CloudDetector, FirewallRule};
+use crate::validation::validate_connection_fields;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Parse and analyze collected network connections")]
@@ -167,9 +168,10 @@ impl ConnectionParser {
         let reader = BufReader::new(file);
         
         let mut connections: Vec<ConnectionRecord> = Vec::new();
+        let mut rejected_lines: usize = 0;
         let mut _metadata = None;
         
-        for line in reader.lines() {
+        for (line_no, line) in reader.lines().enumerate() {
             let line = line?;
             if line.contains("\"_metadata\"") {
                 _metadata = Some(line);
@@ -177,11 +179,31 @@ impl ConnectionParser {
             }
             
             if let Ok(record) = serde_json::from_str::<ConnectionRecord>(&line) {
-                connections.push(record);
+                // JSON parsed — now apply the same semantic gate as the server
+                // so a corrupt JSONL file can't poison offline analysis either.
+                match validate_jsonl_record(&record) {
+                    Ok(()) => connections.push(record),
+                    Err(reason) => {
+                        rejected_lines += 1;
+                        eprintln!(
+                            "⚠ Skipping invalid record on JSONL line {}: {}",
+                            line_no + 1, reason
+                        );
+                    }
+                }
+            } else {
+                rejected_lines += 1;
+                eprintln!(
+                    "⚠ Skipping unparseable JSON on JSONL line {}",
+                    line_no + 1
+                );
             }
         }
         
         println!("Loaded {} connection records", connections.len());
+        if rejected_lines > 0 {
+            println!("Rejected {} unparseable or semantically invalid records", rejected_lines);
+        }
         
         // Group by process
         let mut process_map: HashMap<(u32, String), Vec<ConnectionRecord>> = HashMap::new();
@@ -226,8 +248,13 @@ impl ConnectionParser {
                     *port_counts.entry(port).or_insert(0) += 1;
                 }
 
-                // Detect cloud provider
-                let ip: IpAddr = conn.remote_ip.parse().unwrap_or_else(|_| "0.0.0.0".parse().unwrap());
+                // Detect cloud provider.  Invalid IPs were rejected above, but
+                // skip defensively instead of silently substituting 0.0.0.0,
+                // which would misattribute every bad record to one address.
+                let ip: IpAddr = match conn.remote_ip.parse() {
+                    Ok(ip) => ip,
+                    Err(_) => continue,
+                };
                 all_seen_ips.insert(ip);
                 if let Some(detection) = self.cloud_detector.detect(&ip, conn.remote_hostname.as_deref()) {
                     all_matched_ips.insert(ip);
@@ -540,6 +567,72 @@ impl ConnectionParser {
 /// Escape a string for use in a single-quoted SQL literal by doubling single quotes.
 fn escape_sql(s: &str) -> String {
     s.replace('\'', "''")
+}
+
+/// Semantic gate for the subset of fields present in JSONL records.
+///
+/// Delegates to the shared rule set in [`validate_connection_fields`]: JSONL
+/// entries do not carry `local_addr`/`remote_addr`, so address-family and
+/// endpoint cross-checks are not possible here, but every common-field check
+/// the upload server applies still runs on the offline parse path too.
+fn validate_jsonl_record(r: &ConnectionRecord) -> Result<(), String> {
+    validate_connection_fields(
+        r.pid,
+        &r.process_name,
+        &r.protocol,
+        &r.remote_ip,
+        r.remote_port,
+        r.remote_hostname.as_deref(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base() -> ConnectionRecord {
+        ConnectionRecord {
+            timestamp: None,
+            pid: 100,
+            process_name: "curl".to_string(),
+            protocol: "TCP".to_string(),
+            remote_port: Some(443),
+            remote_ip: "203.0.113.7".to_string(),
+            remote_hostname: None,
+            ppid: None,
+            command_line: None,
+        }
+    }
+
+    #[test]
+    fn valid_record_and_null_optionals_pass() {
+        assert!(validate_jsonl_record(&base()).is_ok());
+    }
+
+    #[test]
+    fn ipv6_records_pass() {
+        let r = ConnectionRecord {
+            remote_ip: "2001:db8::1".to_string(),
+            ..base()
+        };
+        assert!(validate_jsonl_record(&r).is_ok());
+    }
+
+    #[test]
+    fn invalid_records_are_rejected() {
+        let cases = vec![
+            ConnectionRecord { pid: 0, ..base() },
+            ConnectionRecord { protocol: "ICMP".to_string(), ..base() },
+            ConnectionRecord { remote_ip: "not-an-ip".to_string(), ..base() },
+            ConnectionRecord { remote_port: Some(0), ..base() },
+            ConnectionRecord { remote_port: None, ..base() },
+            ConnectionRecord { process_name: String::new(), ..base() },
+            ConnectionRecord { remote_hostname: Some(String::new()), ..base() },
+        ];
+        for r in &cases {
+            assert!(validate_jsonl_record(r).is_err());
+        }
+    }
 }
 
 /// Parse the `-k <group>` service group name from an svchost.exe command line.

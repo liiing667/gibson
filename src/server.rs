@@ -14,6 +14,7 @@ use std::time::SystemTime;
 use crate::asn_db::AsnDb;
 use crate::cloud_detector::{lookup_arin, ArinResult, CloudDetector};
 use crate::collector_v2::{ConnectionRecord, UploadBatch};
+use crate::validation::validate_record;
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -56,6 +57,20 @@ struct Session {
     records: Vec<ConnectionRecord>,
 }
 
+/// A record that failed semantic validation.  It is kept out of every session
+/// (so it can never bias cloud attribution or anomaly detection) but retained
+/// here for audit/forensics via `GET /api/quarantine`.
+#[derive(Clone, Serialize)]
+struct QuarantinedRecord {
+    /// Hostname taken from the enclosing upload batch.
+    hostname: String,
+    batch_id: String,
+    received_unix: u64,
+    /// Human-readable reason the record was rejected.
+    reason: String,
+    record: ConnectionRecord,
+}
+
 impl Session {
     fn new(hostname: String, records: Vec<ConnectionRecord>) -> Self {
         let now = unix_now();
@@ -82,6 +97,8 @@ fn unix_now() -> u64 {
 struct AppState {
     // Keyed by hostname so batches from the same machine accumulate.
     sessions: Arc<Mutex<HashMap<String, Session>>>,
+    // Records rejected at validation time, kept isolated from all analysis.
+    quarantine: Arc<Mutex<Vec<QuarantinedRecord>>>,
     cloud_detector: Arc<CloudDetector>,
     api_key: Option<String>,
     // IP string -> ARIN result (None = looked up, no record found).
@@ -99,12 +116,24 @@ struct HealthResponse {
     status: &'static str,
     machines: usize,
     total_records: usize,
+    quarantined_records: usize,
+}
+
+#[derive(Serialize)]
+struct Rejection {
+    /// Zero-based index of the offending record inside the uploaded batch.
+    index: usize,
+    reason: String,
 }
 
 #[derive(Serialize)]
 struct UploadResponse {
-    session_id: String,
+    /// `None` when every record in the batch was rejected (no session created
+    /// or touched by the upload).
+    session_id: Option<String>,
     records_accepted: usize,
+    records_rejected: usize,
+    rejections: Vec<Rejection>,
     total_for_machine: usize,
 }
 
@@ -258,6 +287,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
 
     let state = AppState {
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        quarantine: Arc::new(Mutex::new(Vec::new())),
         cloud_detector: Arc::new(cloud_detector),
         api_key: opts.api_key.clone(),
         arin_cache: Arc::new(Mutex::new(arin_cache_initial)),
@@ -270,6 +300,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/upload", post(handle_upload))
         .route("/api/sessions", get(handle_list_sessions))
         .route("/api/sessions/:hostname", get(handle_get_session))
+        .route("/api/quarantine", get(handle_quarantine))
         .route("/api/patterns", get(handle_cross_machine))
         .with_state(state);
 
@@ -282,6 +313,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     println!("  POST /upload          — receive data from collectors");
     println!("  GET  /api/sessions    — list machines");
     println!("  GET  /api/sessions/:h — patterns for one machine");
+    println!("  GET  /api/quarantine  — records rejected by validation");
     println!("  GET  /api/patterns    — cross-machine analysis");
     if opts.api_key.is_some() {
         println!("✓ API key authentication enabled");
@@ -299,10 +331,12 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
 async fn handle_health(State(state): State<AppState>) -> Json<HealthResponse> {
     let sessions = state.sessions.lock().unwrap();
     let total_records: usize = sessions.values().map(|s| s.records.len()).sum();
+    let quarantined_records = state.quarantine.lock().unwrap().len();
     Json(HealthResponse {
         status: "ok",
         machines: sessions.len(),
         total_records,
+        quarantined_records,
     })
 }
 
@@ -331,32 +365,85 @@ async fn handle_upload(
         serde_json::from_str(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let hostname = batch.hostname.clone();
-    let incoming_count = batch.records.len();
+    let batch_id = batch.batch_id.clone();
+    let now = unix_now();
+
+    // Gate every record on semantic validation *before* it can touch a
+    // session.  JSON being parseable is necessary but nowhere near sufficient:
+    // garbage IPs, zero ports/PIDs and protocol/family contradictions must be
+    // isolated here or they poison every downstream report.
+    let mut valid: Vec<ConnectionRecord> = Vec::with_capacity(batch.records.len());
+    let mut rejections: Vec<Rejection> = Vec::new();
+    let mut quarantined: Vec<QuarantinedRecord> = Vec::new();
+
+    for (index, record) in batch.records.into_iter().enumerate() {
+        match validate_record(&record) {
+            Ok(()) => valid.push(record),
+            Err(reason) => {
+                quarantined.push(QuarantinedRecord {
+                    hostname: hostname.clone(),
+                    batch_id: batch_id.clone(),
+                    received_unix: now,
+                    reason: reason.clone(),
+                    record,
+                });
+                rejections.push(Rejection { index, reason });
+            }
+        }
+    }
+
+    let records_accepted = valid.len();
+    let records_rejected = quarantined.len();
     let session_id;
     let total_for_machine;
 
     {
         let mut sessions = state.sessions.lock().unwrap();
-        let session = sessions
-            .entry(hostname.clone())
-            .or_insert_with(|| Session::new(hostname.clone(), Vec::new()));
+        if valid.is_empty() {
+            // All records were invalid — do not create or extend a session.
+            (session_id, total_for_machine) = match sessions.get(&hostname) {
+                Some(s) => (Some(s.id.clone()), s.records.len()),
+                None => (None, 0),
+            };
+        } else {
+            let session = sessions
+                .entry(hostname.clone())
+                .or_insert_with(|| Session::new(hostname.clone(), Vec::new()));
 
-        session.records.extend(batch.records);
-        session.last_seen_unix = unix_now();
-        session_id = session.id.clone();
-        total_for_machine = session.records.len();
+            session.records.extend(valid);
+            session.last_seen_unix = now;
+            session_id = Some(session.id.clone());
+            total_for_machine = session.records.len();
+        }
+    }
+
+    if !quarantined.is_empty() {
+        let mut q = state.quarantine.lock().unwrap();
+        q.append(&mut quarantined);
     }
 
     println!(
-        "[upload] {} — +{} records ({} total)",
-        hostname, incoming_count, total_for_machine
+        "[upload] {} — {} accepted, {} rejected ({} total)",
+        hostname, records_accepted, records_rejected, total_for_machine
     );
 
     Ok(Json(UploadResponse {
         session_id,
-        records_accepted: incoming_count,
+        records_accepted,
+        records_rejected,
+        rejections,
         total_for_machine,
     }))
+}
+
+/// Return every record quarantined by upload validation, newest last.
+async fn handle_quarantine(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<QuarantinedRecord>>, StatusCode> {
+    check_api_key(&state, &headers)?;
+    let quarantine = state.quarantine.lock().unwrap();
+    Ok(Json(quarantine.clone()))
 }
 
 async fn handle_list_sessions(
