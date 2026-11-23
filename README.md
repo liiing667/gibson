@@ -193,6 +193,43 @@ cargo run --release -- parse \
   --whitelist-processes "chrome,firefox,safari,edge"
 ```
 
+### Built-in Analysis Server (`serve`)
+
+The built-in server aggregates collector batches and serves per-host and
+cross-machine analysis:
+
+```bash
+# Keyless local mode — every endpoint is open (default, no --api-key)
+cargo run --release -- serve --bind 127.0.0.1:8080
+
+# Authenticated mode — the same key guards uploads, session creation,
+# and all analysis reads
+cargo run --release -- serve --bind 0.0.0.0:8080 --api-key "your-secure-api-key"
+```
+
+When `--api-key` is set, **all** data endpoints require the key:
+
+| Endpoint | Auth required |
+|---|---|
+| `POST /upload` | yes — rejected batches create no session |
+| `GET /api/sessions` | yes |
+| `GET /api/sessions/:hostname` | yes |
+| `GET /api/patterns` (cross-machine) | yes |
+| `GET /health` | no (liveness probe) |
+
+Two header forms are accepted, so older clients keep working:
+
+```bash
+# Current Gibson agent header
+curl -H "X-API-Key: your-secure-api-key" http://server:8080/api/sessions
+
+# Legacy/standard bearer header
+curl -H "Authorization: Bearer your-secure-api-key" http://server:8080/api/sessions
+```
+
+Without `--api-key` the server runs in keyless local mode and accepts every
+request, preserving the original single-machine workflow.
+
 ## Web Server Setup for Data Collection
 
 ### Option 1: Simple Python Flask Server

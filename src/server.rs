@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     routing::{get, post},
     Json, Router,
 };
@@ -24,7 +24,9 @@ pub struct ServerOpts {
     #[arg(long, default_value = "0.0.0.0:8080")]
     pub bind: String,
 
-    /// Required API key (sent by collectors as X-API-Key header)
+    /// Required API key for every endpoint.  Collectors send it as the
+    /// X-API-Key header; legacy clients may use `Authorization: Bearer <key>`.
+    /// When unset the server runs in keyless local mode.
     #[arg(long)]
     pub api_key: Option<String>,
 
@@ -284,9 +286,9 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     println!("  GET  /api/sessions/:h — patterns for one machine");
     println!("  GET  /api/patterns    — cross-machine analysis");
     if opts.api_key.is_some() {
-        println!("✓ API key authentication enabled");
+        println!("✓ API key authentication enabled (upload and analysis endpoints)");
     } else {
-        println!("⚠  No API key — all uploads accepted");
+        println!("⚠  No API key — keyless local mode, all requests accepted");
     }
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -307,15 +309,35 @@ async fn handle_health(State(state): State<AppState>) -> Json<HealthResponse> {
 }
 
 /// Returns `Err(UNAUTHORIZED)` if the state has an API key and the request
-/// does not present a matching `X-API-Key` header.  When no key is configured
-/// every request is allowed through.
+/// does not present a matching key.  When no key is configured every request
+/// is allowed through (keyless local mode).
+///
+/// Two header forms are accepted so older clients keep working:
+///   * `X-API-Key: <key>`         — the current Gibson agent header
+///   * `Authorization: Bearer <key>` — legacy/standard bearer header
 fn check_api_key(state: &AppState, headers: &HeaderMap) -> Result<(), StatusCode> {
     if let Some(expected) = &state.api_key {
-        let provided = headers
+        let api_key_header = headers
             .get("x-api-key")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if provided != expected {
+
+        // Legacy clients may send the key as an HTTP bearer token instead of
+        // the Gibson-specific `X-API-Key` header.  Strip the scheme prefix
+        // case-insensitively and fall back to the raw value for clients that
+        // sent the bare key in the Authorization header.
+        let bearer_header = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| {
+                v.strip_prefix("Bearer ")
+                    .or_else(|| v.strip_prefix("bearer "))
+                    .unwrap_or(v)
+                    .trim()
+            })
+            .unwrap_or("");
+
+        if api_key_header != expected && bearer_header != expected {
             return Err(StatusCode::UNAUTHORIZED);
         }
     }
@@ -324,9 +346,14 @@ fn check_api_key(state: &AppState, headers: &HeaderMap) -> Result<(), StatusCode
 
 async fn handle_upload(
     State(state): State<AppState>,
+    headers: HeaderMap,
     body: String,
 ) -> Result<Json<UploadResponse>, StatusCode> {
-    // Upload is intentionally unauthenticated — agents are anonymous.
+    // Same authentication decision as the read endpoints and session
+    // creation: when a key is configured the collector must present it.
+    // Keyless deployments (local mode) and legacy header forms still pass.
+    check_api_key(&state, &headers)?;
+
     let batch: UploadBatch =
         serde_json::from_str(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
 
@@ -924,5 +951,134 @@ impl IsPrivate for IpAddr {
             IpAddr::V4(a) => a.is_private() || a.is_link_local(),
             IpAddr::V6(a) => a.is_loopback(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_with_key(api_key: Option<&str>) -> AppState {
+        AppState {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            cloud_detector: Arc::new(CloudDetector::new()),
+            api_key: api_key.map(str::to_string),
+            arin_cache: Arc::new(Mutex::new(HashMap::new())),
+            arin_cache_path: None,
+            asn_db: None,
+        }
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn keyless_mode_allows_every_request() {
+        let state = state_with_key(None);
+        // No headers at all — local mode must stay open.
+        assert!(check_api_key(&state, &HeaderMap::new()).is_ok());
+        // Stray/legacy headers are harmless when no key is configured.
+        assert!(check_api_key(&state, &headers(&[("x-api-key", "anything")])).is_ok());
+        assert!(check_api_key(
+            &state,
+            &headers(&[("authorization", "Bearer anything")])
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn keyed_mode_requires_a_matching_key_on_every_endpoint() {
+        let state = state_with_key(Some("secret"));
+
+        // Anonymous and wrong-key requests must be rejected.
+        assert_eq!(
+            check_api_key(&state, &HeaderMap::new()).unwrap_err(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            check_api_key(&state, &headers(&[("x-api-key", "nope")])).unwrap_err(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            check_api_key(
+                &state,
+                &headers(&[("authorization", "Bearer nope")])
+            )
+            .unwrap_err(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // Current agent header works.
+        assert!(check_api_key(&state, &headers(&[("x-api-key", "secret")])).is_ok());
+        // Legacy bearer header keeps working.
+        assert!(check_api_key(
+            &state,
+            &headers(&[("authorization", "Bearer secret")])
+        )
+        .is_ok());
+        // Header names are case-insensitive per HTTP semantics.
+        assert!(check_api_key(
+            &state,
+            &headers(&[("X-API-Key", "secret")])
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn upload_shares_the_same_auth_decision_as_read_endpoints() {
+        let batch = serde_json::json!({
+            "batch_id": "hostA_1",
+            "hostname": "hostA",
+            // serde's SystemTime representation.
+            "timestamp": {"secs_since_epoch": 1_700_000_000u64,
+                           "nanos_since_epoch": 0u32},
+            "records": [],
+            "metadata": null,
+        })
+        .to_string();
+
+        // Keyed server: anonymous upload is rejected and creates no session.
+        let keyed = state_with_key(Some("secret"));
+        let err = handle_upload(State(keyed.clone()), HeaderMap::new(), batch.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(err, StatusCode::UNAUTHORIZED);
+        assert!(keyed.sessions.lock().unwrap().is_empty());
+
+        // Keyed server: legacy bearer header is accepted on upload too.
+        let ok = handle_upload(
+            State(keyed.clone()),
+            headers(&[("authorization", "Bearer secret")]),
+            batch.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok.records_accepted, 0);
+        assert!(keyed.sessions.lock().unwrap().contains_key("hostA"));
+
+        // Keyed server: bad JSON with a valid key is a 400, not an auth error.
+        let err = handle_upload(
+            State(keyed.clone()),
+            headers(&[("x-api-key", "secret")]),
+            "{not json".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, StatusCode::BAD_REQUEST);
+
+        // Keyless server: anonymous upload still works (local mode).
+        let keyless = state_with_key(None);
+        handle_upload(State(keyless.clone()), HeaderMap::new(), batch)
+            .await
+            .unwrap();
+        assert!(keyless.sessions.lock().unwrap().contains_key("hostA"));
     }
 }
