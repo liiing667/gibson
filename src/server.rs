@@ -6,7 +6,7 @@ use axum::{
 };
 use clap::Parser;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -54,17 +54,109 @@ struct Session {
     first_seen_unix: u64,
     last_seen_unix: u64,
     records: Vec<ConnectionRecord>,
+    /// Identity of every sample that has been admitted to this session.
+    ///
+    /// Uploads are retried by the agents and collectors routinely backfill old
+    /// batches.  Without this set those retries look like fresh observations
+    /// and change every downstream count (and, for the beacon detector, the
+    /// grouping of one connection's samples).
+    admitted: HashMap<SampleKey, usize>,
 }
 
 impl Session {
     fn new(hostname: String, records: Vec<ConnectionRecord>) -> Self {
         let now = unix_now();
-        Session {
+        let mut session = Session {
             id: format!("{}-{}", hostname, now),
             hostname,
             first_seen_unix: now,
             last_seen_unix: now,
-            records,
+            records: Vec::new(),
+            admitted: HashMap::new(),
+        };
+        session.admit(records);
+        session
+    }
+
+    /// Admit a batch of samples and return the number of *new* observations.
+    ///
+    /// Admission is the only place where the session's observation set grows.
+    /// It is deliberately idempotent: replaying the same batch (a retry, a
+    /// duplicate upload, or a late backfill of records we already have) adds
+    /// nothing and therefore cannot change the candidate report for the
+    /// current observation generation.
+    fn admit(&mut self, incoming: Vec<ConnectionRecord>) -> usize {
+        let mut accepted = 0usize;
+        for record in incoming {
+            let key = SampleKey::from(&record);
+            let existing_index = self.admitted.get(&key).copied();
+            if let Some(index) = existing_index {
+                // A retry may be re-stamped inside the same observation
+                // window.  Keep a deterministic representative (earliest
+                // timestamp, lexicographically smallest hostname) so replay
+                // order cannot change interval evidence.
+                let existing = &mut self.records[index];
+                let mut host = existing.remote_hostname.clone();
+                merge_hostname(&mut host, record.remote_hostname.as_deref());
+                if record.timestamp < existing.timestamp {
+                    *existing = record;
+                }
+                existing.remote_hostname = host;
+            } else {
+                let index = self.records.len();
+                self.records.push(record);
+                self.admitted.insert(key, index);
+                accepted += 1;
+            }
+        }
+        accepted
+    }
+
+    /// Number of distinct observations in the current generation.
+    ///
+    /// This is content-derived rather than wall-clock derived: replaying the
+    /// same observations (in any order or batch split) yields the same value.
+    fn observation_generation(&self) -> u64 {
+        self.records.len() as u64
+    }
+}
+
+/// Stable identity of one collected sample.
+///
+/// The (normalized) timestamp is part of the identity, but non-semantic
+/// presentation fields (reverse-DNS name, command line, parent PID)
+/// intentionally are not: a retried upload may resolve DNS again or refresh
+/// those fields while still describing exactly the same socket observation.
+/// Timestamps are normalized to `observation_bucket` here as well, so a retry
+/// that is re-stamped by a second within the same poll still deduplicates.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SampleKey {
+    timestamp_bucket: i64,
+    pid: u32,
+    process_name: String,
+    protocol: String,
+    local_addr: String,
+    local_port: Option<u16>,
+    remote_addr: String,
+    remote_port: Option<u16>,
+    remote_ip: String,
+    state: Option<String>,
+}
+
+impl From<&ConnectionRecord> for SampleKey {
+    fn from(record: &ConnectionRecord) -> Self {
+        SampleKey {
+            timestamp_bucket: observation_bucket(system_time_secs(record.timestamp))
+                .unwrap_or(i64::MIN),
+            pid: record.pid,
+            process_name: record.process_name.clone(),
+            protocol: record.protocol.clone(),
+            local_addr: record.local_addr.clone(),
+            local_port: record.local_port,
+            remote_addr: record.remote_addr.clone(),
+            remote_port: record.remote_port,
+            remote_ip: record.remote_ip.clone(),
+            state: record.state.clone(),
         }
     }
 }
@@ -104,8 +196,12 @@ struct HealthResponse {
 #[derive(Serialize)]
 struct UploadResponse {
     session_id: String,
+    records_received: usize,
     records_accepted: usize,
+    records_duplicate: usize,
     total_for_machine: usize,
+    /// Content-derived generation of the observation set used by analysis.
+    observation_generation: u64,
 }
 
 #[derive(Serialize)]
@@ -115,6 +211,8 @@ pub struct SessionSummary {
     first_seen_unix: u64,
     last_seen_unix: u64,
     record_count: usize,
+    /// Number of distinct observations in this generation.
+    observation_generation: u64,
 }
 
 // ─── pattern report types ─────────────────────────────────────────────────────
@@ -124,6 +222,9 @@ pub struct SessionSummary {
 pub struct SessionAnalysis {
     pub session: SessionSummary,
     pub patterns: PatternReport,
+    /// Generation covered by `patterns`.  Admission and analysis are always
+    /// performed against this same immutable generation.
+    pub observation_generation: u64,
     /// ARIN registration info for IPs not matched by any known cloud provider.
     pub arin_results: HashMap<String, ArinResult>,
 }
@@ -145,7 +246,8 @@ pub struct BeaconingCandidate {
     pub process: String,
     pub remote_ip: String,
     pub remote_host: Option<String>,
-    /// Number of distinct appearances after deduplicating poll-adjacent timestamps.
+    /// Number of distinct appearances after normalizing timestamps onto the
+    /// absolute observation grid and deduplicating repeated polls.
     pub distinct_appearances: usize,
     /// Mean time between re-establishments (seconds).
     pub interval_mean_secs: f64,
@@ -207,6 +309,7 @@ pub struct SharedIp {
 pub struct MachineSummary {
     pub hostname: String,
     pub record_count: usize,
+    pub observation_generation: u64,
     pub beacon_count: usize,
     pub high_entropy_count: usize,
     pub noncloud_freq_count: usize,
@@ -331,9 +434,11 @@ async fn handle_upload(
         serde_json::from_str(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let hostname = batch.hostname.clone();
-    let incoming_count = batch.records.len();
+    let received_count = batch.records.len();
     let session_id;
     let total_for_machine;
+    let accepted_count;
+    let observation_generation;
 
     {
         let mut sessions = state.sessions.lock().unwrap();
@@ -341,21 +446,30 @@ async fn handle_upload(
             .entry(hostname.clone())
             .or_insert_with(|| Session::new(hostname.clone(), Vec::new()));
 
-        session.records.extend(batch.records);
-        session.last_seen_unix = unix_now();
+        // Admission and generation bookkeeping happen under the same lock as
+        // the analysis snapshot.  A batch is therefore either completely in a
+        // generation or completely absent from it — never half-admitted.
+        accepted_count = session.admit(batch.records);
+        // A late/old report must not move the session's wall-clock watermark
+        // backwards if the server clock is adjusted.
+        session.last_seen_unix = session.last_seen_unix.max(unix_now());
         session_id = session.id.clone();
         total_for_machine = session.records.len();
+        observation_generation = session.observation_generation();
     }
 
     println!(
-        "[upload] {} — +{} records ({} total)",
-        hostname, incoming_count, total_for_machine
+        "[upload] {} — {} received, {} new ({} total, generation {})",
+        hostname, received_count, accepted_count, total_for_machine, observation_generation
     );
 
     Ok(Json(UploadResponse {
         session_id,
-        records_accepted: incoming_count,
+        records_received: received_count,
+        records_accepted: accepted_count,
+        records_duplicate: received_count.saturating_sub(accepted_count),
         total_for_machine,
+        observation_generation,
     }))
 }
 
@@ -373,9 +487,14 @@ async fn handle_list_sessions(
             first_seen_unix: s.first_seen_unix,
             last_seen_unix: s.last_seen_unix,
             record_count: s.records.len(),
+            observation_generation: s.observation_generation(),
         })
         .collect();
-    list.sort_by_key(|s| s.first_seen_unix);
+    list.sort_by(|a, b| {
+        a.first_seen_unix
+            .cmp(&b.first_seen_unix)
+            .then_with(|| a.hostname.cmp(&b.hostname))
+    });
     Ok(Json(list))
 }
 
@@ -387,19 +506,27 @@ async fn handle_get_session(
     check_api_key(&state, &headers)?;
     // Hold the session lock only long enough to clone what we need,
     // then release it before doing any async work.
-    let (summary, patterns, unmatched) = {
+    let (summary, patterns, unmatched, observation_generation) = {
         let sessions = state.sessions.lock().unwrap();
         let session = sessions.get(&hostname).ok_or(StatusCode::NOT_FOUND)?;
-        let patterns = analyze_patterns(&session.records, &state.cloud_detector);
-        let unmatched = collect_unmatched_ips(&session.records, &state.cloud_detector);
+
+        // Take one immutable snapshot of the admitted records and derive every
+        // part of the report from it.  Admission, timestamp normalization and
+        // candidate reporting therefore describe the same observation
+        // generation even if a late upload is being handled concurrently.
+        let records = session.records.clone();
+        let observation_generation = session.observation_generation();
+        let patterns = analyze_patterns(&records, &state.cloud_detector);
+        let unmatched = collect_unmatched_ips(&records, &state.cloud_detector);
         let summary = SessionSummary {
             id: session.id.clone(),
             hostname: session.hostname.clone(),
             first_seen_unix: session.first_seen_unix,
             last_seen_unix: session.last_seen_unix,
-            record_count: session.records.len(),
+            record_count: records.len(),
+            observation_generation,
         };
-        (summary, patterns, unmatched)
+        (summary, patterns, unmatched, observation_generation)
     };
 
     let arin_results = resolve_ip_ownership(
@@ -413,6 +540,7 @@ async fn handle_get_session(
     Ok(Json(SessionAnalysis {
         session: summary,
         patterns,
+        observation_generation,
         arin_results,
     }))
 }
@@ -469,21 +597,24 @@ async fn handle_cross_machine(
                 .cmp(&a.is_known_cloud)
                 .reverse()
                 .then(b.total_connections.cmp(&a.total_connections))
+                .then_with(|| a.remote_ip.cmp(&b.remote_ip))
         });
 
-        let by_machine: Vec<MachineSummary> = sessions
+        let mut by_machine: Vec<MachineSummary> = sessions
             .values()
             .map(|s| {
                 let p = analyze_patterns(&s.records, &state.cloud_detector);
                 MachineSummary {
                     hostname: s.hostname.clone(),
                     record_count: s.records.len(),
+                    observation_generation: s.observation_generation(),
                     beacon_count: p.beaconing_candidates.len(),
                     high_entropy_count: p.high_entropy_hosts.len(),
                     noncloud_freq_count: p.high_freq_noncloud.len(),
                 }
             })
             .collect();
+        by_machine.sort_by(|a, b| a.hostname.cmp(&b.hostname));
 
         // Aggregate unmatched IPs across all sessions.
         let all_unmatched: Vec<IpAddr> = sessions
@@ -624,7 +755,7 @@ async fn resolve_ip_ownership(
 
 // ─── pattern analysis ─────────────────────────────────────────────────────────
 
-fn analyze_patterns(records: &[ConnectionRecord], detector: &CloudDetector) -> PatternReport {
+pub fn analyze_patterns(records: &[ConnectionRecord], detector: &CloudDetector) -> PatternReport {
     PatternReport {
         beaconing_candidates: detect_beaconing(records, detector),
         high_entropy_hosts: detect_high_entropy_hosts(records),
@@ -633,51 +764,151 @@ fn analyze_patterns(records: &[ConnectionRecord], detector: &CloudDetector) -> P
     }
 }
 
+/// Width of one normalized observation bucket, in seconds.
+///
+/// This is the collector's default poll cadence: all samples from one poll
+/// belong to the same observation.  Buckets are aligned to the Unix epoch, not
+/// to the first record in the batch, which is what makes late arrivals and
+/// clock regressions stable.
+pub const OBSERVATION_WINDOW_SECS: f64 = 5.0;
+
+/// Gaps at or below this threshold are treated as repeated observations of the
+/// same connection rather than a new connection attempt.
+const MIN_BEACON_INTERVAL_SECS: f64 = 15.0;
+
+/// Consecutive samples this close together are repeated observations of the
+/// same poll burst.  This is deliberately larger than the historical 6-second
+/// window so collectors polling every 10 seconds are handled too, while still
+/// staying below the minimum beacon interval.
+const POLL_ADJACENT_SECS: f64 = 10.0;
+
+/// Convert a `SystemTime` into signed seconds since the Unix epoch.
+///
+/// `SystemTime::duration_since` fails for instants before the epoch.  Treating
+/// those as zero would merge every such sample into one bucket and would make
+/// a clock regression look like a burst.  Keep the sign instead so ordering is
+/// still well defined.
+fn system_time_secs(ts: SystemTime) -> f64 {
+    match ts.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs_f64(),
+        Err(err) => -err.duration().as_secs_f64(),
+    }
+}
+
+/// Map an instant to its absolute, epoch-aligned observation bucket.
+fn observation_bucket(secs: f64) -> Option<i64> {
+    if !secs.is_finite() {
+        return None;
+    }
+    let bucket = (secs / OBSERVATION_WINDOW_SECS).round();
+    if bucket < i64::MIN as f64 || bucket > i64::MAX as f64 {
+        return None;
+    }
+    Some(bucket as i64)
+}
+
+/// Keep the lexicographically smallest non-empty hostname so duplicate
+/// observations with different DNS outcomes still produce deterministic output.
+fn merge_hostname(current: &mut Option<String>, candidate: Option<&str>) {
+    let candidate = match candidate {
+        Some(name) if !name.is_empty() => name,
+        _ => return,
+    };
+    let should_replace = match current.as_deref() {
+        Some(existing) => existing > candidate,
+        None => true,
+    };
+    if should_replace {
+        *current = Some(candidate.to_string());
+    }
+}
+
+/// One normalized appearance inside an absolute observation bucket.
+///
+/// The bucket decides *membership* (and therefore cannot be moved by a late
+/// arrival), while the representative keeps the earliest timestamp observed in
+/// that bucket so interval evidence stays in real units.
+struct ObservationSlot {
+    observed_at: f64,
+}
+
 /// Detect processes that re-connect to the same IP at suspiciously regular intervals.
 ///
 /// Algorithm:
 ///   1. Group records by (process, remote_ip).
-///   2. Sort timestamps and collapse poll-adjacent duplicates (gap < 6 s) so
-///      a persistent TCP connection that appears every poll doesn't look like beaconing.
-///   3. Compute inter-arrival gaps between distinct appearances.
-///      Only gaps > 15 s are kept — smaller gaps are just consecutive polls.
+///   2. Normalize every timestamp onto a fixed, epoch-aligned observation
+///      grid.  Samples that describe the same poll therefore collapse to one
+///      observation regardless of when they arrive, whether they were retried,
+///      or how the batch was split.  The grid is absolute (it does not depend
+///      on the smallest timestamp seen so far), so a late/backfilled sample
+///      cannot move the bucket boundaries of observations already in the
+///      generation.
+///   3. Walk the normalized observations in time order, collapse poll-adjacent
+///      re-samples into one appearance, and compute inter-arrival gaps.  Only
+///      gaps > 15 s are kept — smaller gaps are just consecutive polls.
 ///   4. If there are ≥ 3 such gaps, compute mean, stddev, and CV (stddev/mean).
 ///      CV < 0.4 → regular timing → beacon candidate.
-fn detect_beaconing(
+///
+/// The function is a pure function of the *set* of admitted observations.  It
+/// never relies on insertion order, so replaying the same sequence in a
+/// different order (or with duplicated/backfilled batches) produces the same
+/// candidates and interval evidence.
+pub fn detect_beaconing(
     records: &[ConnectionRecord],
     detector: &CloudDetector,
 ) -> Vec<BeaconingCandidate> {
-    // (process, remote_ip) -> (sorted timestamps, first seen hostname)
-    let mut groups: HashMap<(String, String), (Vec<f64>, Option<String>)> = HashMap::new();
+    // (process, remote_ip) -> (observation bucket -> representative, first seen hostname)
+    let mut groups: HashMap<
+        (String, String),
+        (BTreeMap<i64, ObservationSlot>, Option<String>),
+    > = HashMap::new();
 
     for r in records {
-        let ts = r
-            .timestamp
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
+        let secs = system_time_secs(r.timestamp);
+        let bucket = match observation_bucket(secs) {
+            Some(bucket) => bucket,
+            None => continue,
+        };
         let key = (r.process_name.clone(), r.remote_ip.clone());
         let entry = groups
             .entry(key)
-            .or_insert_with(|| (Vec::new(), r.remote_hostname.clone()));
-        entry.0.push(ts);
-        if entry.1.is_none() {
-            entry.1 = r.remote_hostname.clone();
+            .or_insert_with(|| (BTreeMap::new(), None));
+
+        // Keep the earliest instant in the bucket as its representative and
+        // choose the hostname deterministically.  A retry may have resolved
+        // DNS differently; picking the lexicographically smallest name makes
+        // the report independent of upload order.
+        {
+            let slot = entry
+                .0
+                .entry(bucket)
+                .or_insert_with(|| ObservationSlot {
+                    observed_at: secs,
+                });
+            if secs < slot.observed_at {
+                slot.observed_at = secs;
+            }
         }
+        merge_hostname(&mut entry.1, r.remote_hostname.as_deref());
     }
 
     let mut candidates = Vec::new();
 
-    for ((process, ip), (mut times, remote_host)) in groups {
-        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-        // Collapse poll-adjacent timestamps: keep only the first of each "burst"
-        // where the gap to the previous kept timestamp is ≤ 6 s.
+    for ((process, ip), (buckets, remote_host)) in groups {
+        // BTreeMap already yields the buckets in normalized-time order, so the
+        // result depends only on the observation set, not on arrival order.
+        // Within that order, collapse retries/re-samples that land in
+        // neighbouring buckets but still belong to the same polling burst.
         let mut distinct: Vec<f64> = Vec::new();
-        for t in times {
-            if distinct.last().is_none_or(|&last| t - last > 6.0) {
-                distinct.push(t);
+        let mut previous_sample: Option<f64> = None;
+        for slot in buckets.values() {
+            let observed_at = slot.observed_at;
+            let starts_new_burst = previous_sample
+                .map_or(true, |previous| observed_at - previous > POLL_ADJACENT_SECS);
+            if starts_new_burst {
+                distinct.push(observed_at);
             }
+            previous_sample = Some(observed_at);
         }
 
         if distinct.len() < 5 {
@@ -689,7 +920,7 @@ fn detect_beaconing(
         let gaps: Vec<f64> = distinct
             .windows(2)
             .map(|w| w[1] - w[0])
-            .filter(|&g| g > 15.0)
+            .filter(|&g| g > MIN_BEACON_INTERVAL_SECS)
             .collect();
 
         if gaps.len() < 3 {
@@ -735,7 +966,16 @@ fn detect_beaconing(
         });
     }
 
-    candidates.sort_by(|a, b| b.suspicion_score.partial_cmp(&a.suspicion_score).unwrap());
+    // Deterministic total ordering: equal-scoring groups must not reorder
+    // across replays because of HashMap iteration order.
+    candidates.sort_by(|a, b| {
+        b.suspicion_score
+            .partial_cmp(&a.suspicion_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.process.cmp(&b.process))
+            .then_with(|| a.remote_ip.cmp(&b.remote_ip))
+            .then_with(|| b.distinct_appearances.cmp(&a.distinct_appearances))
+    });
     candidates.truncate(20);
     candidates
 }
@@ -823,7 +1063,9 @@ fn detect_high_entropy_hosts(records: &[ConnectionRecord]) -> Vec<HighEntropyHos
     findings.sort_by(|a, b| {
         b.entropy_bits_per_char
             .partial_cmp(&a.entropy_bits_per_char)
-            .unwrap()
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.hostname.cmp(&b.hostname))
+            .then_with(|| a.process.cmp(&b.process))
     });
     findings.truncate(20);
     findings
@@ -863,7 +1105,13 @@ fn detect_port_anomalies(records: &[ConnectionRecord]) -> Vec<PortAnomaly> {
         })
         .collect();
 
-    findings.sort_by(|a, b| b.connection_count.cmp(&a.connection_count));
+    findings.sort_by(|a, b| {
+        b.connection_count
+            .cmp(&a.connection_count)
+            .then_with(|| a.port.cmp(&b.port))
+            .then_with(|| a.process.cmp(&b.process))
+            .then_with(|| a.remote_ip.cmp(&b.remote_ip))
+    });
     findings.truncate(25);
     findings
 }
@@ -907,7 +1155,12 @@ fn detect_high_freq_noncloud(
         })
         .collect();
 
-    findings.sort_by(|a, b| b.connection_count.cmp(&a.connection_count));
+    findings.sort_by(|a, b| {
+        b.connection_count
+            .cmp(&a.connection_count)
+            .then_with(|| a.process.cmp(&b.process))
+            .then_with(|| a.remote_ip.cmp(&b.remote_ip))
+    });
     findings.truncate(25);
     findings
 }
@@ -924,5 +1177,161 @@ impl IsPrivate for IpAddr {
             IpAddr::V4(a) => a.is_private() || a.is_link_local(),
             IpAddr::V6(a) => a.is_loopback(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn at(secs: i64) -> SystemTime {
+        if secs >= 0 {
+            std::time::UNIX_EPOCH + Duration::from_secs(secs as u64)
+        } else {
+            std::time::UNIX_EPOCH - Duration::from_secs((-secs) as u64)
+        }
+    }
+
+    fn record(secs: i64, local_port: u16) -> ConnectionRecord {
+        ConnectionRecord {
+            timestamp: at(secs),
+            pid: 4242,
+            process_name: "beacon.exe".to_string(),
+            protocol: "TCP".to_string(),
+            local_addr: "10.0.0.5".to_string(),
+            local_port: Some(local_port),
+            remote_addr: "203.0.113.9:443".to_string(),
+            remote_port: Some(443),
+            remote_ip: "203.0.113.9".to_string(),
+            remote_hostname: Some("c2.example".to_string()),
+            state: Some("Established".to_string()),
+            ppid: Some(1),
+            command_line: None,
+        }
+    }
+
+    fn summary(candidates: &[BeaconingCandidate]) -> Vec<(String, String, usize, u64, u64)> {
+        let mut out: Vec<_> = candidates
+            .iter()
+            .map(|c| {
+                (
+                    c.process.clone(),
+                    c.remote_ip.clone(),
+                    c.distinct_appearances,
+                    (c.interval_mean_secs * 1000.0).round() as u64,
+                    (c.interval_stddev_secs * 1000.0).round() as u64,
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn beacon_evidence_is_order_and_duplicate_invariant() {
+        let detector = CloudDetector::new();
+        let ordered: Vec<_> = [0_i64, 60, 120, 180, 240, 300]
+            .iter()
+            .map(|&t| record(t, 50000))
+            .collect();
+
+        let mut replayed = Vec::new();
+        for &t in [300_i64, 0, 180, 60, 240, 120].iter() {
+            replayed.push(record(t, 50000));
+            replayed.push(record(t, 50000)); // duplicate upload of the same sample
+        }
+
+        let a = detect_beaconing(&ordered, &detector);
+        let b = detect_beaconing(&replayed, &detector);
+
+        assert_eq!(summary(&a), summary(&b));
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].distinct_appearances, 6);
+        assert_eq!(a[0].interval_mean_secs, 60.0);
+        assert_eq!(a[0].interval_stddev_secs, 0.0);
+    }
+
+    #[test]
+    fn repeated_polls_of_one_connection_are_not_a_beacon() {
+        let detector = CloudDetector::new();
+        let polls: Vec<_> = (0_i64..=300)
+            .step_by(5)
+            .map(|t| record(t, 50000))
+            .collect();
+        assert!(detect_beaconing(&polls, &detector).is_empty());
+
+        let slower_polls: Vec<_> = (0_i64..=300)
+            .step_by(10)
+            .map(|t| record(t, 50000))
+            .collect();
+        assert!(detect_beaconing(&slower_polls, &detector).is_empty());
+    }
+
+    #[test]
+    fn repeated_samples_inside_a_beacon_burst_do_not_add_intervals() {
+        let detector = CloudDetector::new();
+        let mut records = Vec::new();
+        for &t in [0_i64, 60, 120, 180, 240, 300].iter() {
+            records.push(record(t, 50000));
+            records.push(record(t + 5, 50000));
+        }
+
+        let candidates = detect_beaconing(&records, &detector);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].distinct_appearances, 6);
+        assert_eq!(candidates[0].interval_mean_secs, 60.0);
+        assert_eq!(candidates[0].interval_stddev_secs, 0.0);
+    }
+
+    #[test]
+    fn late_backfill_does_not_shift_existing_observations() {
+        let detector = CloudDetector::new();
+        let mut records: Vec<_> = [0_i64, 60, 120, 180, 240, 300]
+            .iter()
+            .map(|&t| record(t, 50000))
+            .collect();
+        let before = summary(&detect_beaconing(&records, &detector));
+
+        // A retry/backfill carrying an older copy of an observation that we
+        // already have must be ignored by admission and by the detector.
+        records.insert(0, record(60, 50000));
+        let after = summary(&detect_beaconing(&records, &detector));
+
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn duplicate_samples_are_not_admitted_twice() {
+        let first = record(0, 50000);
+        let second = record(60, 50000);
+        let mut session = Session::new("host-a".to_string(), vec![first.clone(), second.clone()]);
+
+        assert_eq!(session.records.len(), 2);
+        let generation = session.observation_generation();
+        assert_eq!(session.admit(vec![first, second]), 0);
+        assert_eq!(session.observation_generation(), generation);
+
+        // A genuinely new, older observation is accepted but does not move the
+        // session's generation backwards.
+        assert_eq!(session.admit(vec![record(-60, 50000)]), 1);
+        assert_eq!(session.observation_generation(), generation + 1);
+    }
+
+    #[test]
+    fn admission_is_independent_of_replay_order() {
+        // Both records fall in the same normalized observation bucket.
+        let earlier = record(3, 50000);
+        let later = record(4, 50000);
+
+        let mut a = Session::new("host-a".to_string(), vec![later.clone()]);
+        let mut b = Session::new("host-a".to_string(), vec![earlier.clone()]);
+        assert_eq!(a.admit(vec![earlier]), 0);
+        assert_eq!(b.admit(vec![later]), 0);
+
+        assert_eq!(a.records.len(), 1);
+        assert_eq!(b.records.len(), 1);
+        assert_eq!(a.records[0].timestamp, b.records[0].timestamp);
+        assert_eq!(a.observation_generation(), b.observation_generation());
     }
 }

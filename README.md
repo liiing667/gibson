@@ -193,6 +193,24 @@ cargo run --release -- parse \
   --whitelist-processes "chrome,firefox,safari,edge"
 ```
 
+### Server Observation Semantics
+
+The analysis server treats every upload as a set of samples to be admitted into
+the machine's current observation generation:
+
+- Identical samples (same socket observation, normalized to the collector's
+  5-second poll window) are admitted once. Upload retries, duplicate batches,
+  and backfilled reports therefore cannot inflate counts or change the
+  candidate report.
+- Beacon timestamps are normalized onto an absolute, epoch-aligned observation
+  grid. The grid does not move when a late or out-of-order sample arrives, so
+  replaying the same sequence in a different order produces the same
+  `beaconing_candidates` and interval evidence (`interval_mean_secs`,
+  `interval_stddev_secs`, `jitter_ratio`, and `distinct_appearances`).
+- `POST /upload` reports `records_accepted` (new observations) separately from
+  `records_received`, and analysis responses include the
+  `observation_generation` that the report was computed from.
+
 ## Web Server Setup for Data Collection
 
 ### Option 1: Simple Python Flask Server
