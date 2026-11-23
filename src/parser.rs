@@ -8,7 +8,10 @@ use std::time::SystemTime;
 use tokio::task::JoinSet;
 
 use crate::asn_db::AsnDb;
-use crate::cloud_detector::{lookup_arin, ArinResult, CloudDetector, FirewallRule};
+use crate::cloud_detector::{
+    arin_key, canonical_ip, is_arin_candidate, load_arin_cache, lookup_arin, persist_arin_cache,
+    ArinResult, CloudDetector, FirewallRule,
+};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Parse and analyze collected network connections")]
@@ -227,32 +230,37 @@ impl ConnectionParser {
                 }
 
                 // Detect cloud provider
-                let ip: IpAddr = conn.remote_ip.parse().unwrap_or_else(|_| "0.0.0.0".parse().unwrap());
-                all_seen_ips.insert(ip);
-                if let Some(detection) = self.cloud_detector.detect(&ip, conn.remote_hostname.as_deref()) {
-                    all_matched_ips.insert(ip);
-                    let provider_stats = cloud_providers.entry(detection.provider.name.clone())
-                        .or_insert(CloudProviderStats {
-                            connection_count: 0,
-                            unique_ips: Vec::new(),
-                            unique_domains: Vec::new(),
-                            services: HashMap::new(),
-                        });
-                    
-                    provider_stats.connection_count += 1;
-                    if !provider_stats.unique_ips.contains(&conn.remote_ip) {
-                        provider_stats.unique_ips.push(conn.remote_ip.clone());
-                    }
-                    if let Some(domain) = &conn.remote_hostname {
-                        if !provider_stats.unique_domains.contains(domain) {
-                            provider_stats.unique_domains.push(domain.clone());
+                // Unparseable addresses are skipped rather than collapsed to
+                // 0.0.0.0, so distinct bogus values can never share one
+                // identity in the seen/matched sets or the ARIN cache.
+                if let Ok(ip) = conn.remote_ip.parse::<IpAddr>() {
+                    let ip = canonical_ip(&ip);
+                    all_seen_ips.insert(ip);
+                    if let Some(detection) = self.cloud_detector.detect(&ip, conn.remote_hostname.as_deref()) {
+                        all_matched_ips.insert(ip);
+                        let provider_stats = cloud_providers.entry(detection.provider.name.clone())
+                            .or_insert(CloudProviderStats {
+                                connection_count: 0,
+                                unique_ips: Vec::new(),
+                                unique_domains: Vec::new(),
+                                services: HashMap::new(),
+                            });
+                        
+                        provider_stats.connection_count += 1;
+                        if !provider_stats.unique_ips.contains(&conn.remote_ip) {
+                            provider_stats.unique_ips.push(conn.remote_ip.clone());
                         }
+                        if let Some(domain) = &conn.remote_hostname {
+                            if !provider_stats.unique_domains.contains(domain) {
+                                provider_stats.unique_domains.push(domain.clone());
+                            }
+                        }
+                        if let Some(service) = &detection.provider.service {
+                            *provider_stats.services.entry(service.clone()).or_insert(0) += 1;
+                        }
+                        
+                        all_cloud_detections.push(detection);
                     }
-                    if let Some(service) = &detection.provider.service {
-                        *provider_stats.services.entry(service.clone()).or_insert(0) += 1;
-                    }
-                    
-                    all_cloud_detections.push(detection);
                 }
             }
             
@@ -302,13 +310,19 @@ impl ConnectionParser {
         if let Some(path) = &self.opts.cloud_analysis {
             let providers = self.cloud_detector.get_provider_summary(&all_cloud_detections);
             let mut arin_results: HashMap<String, ArinResult> = HashMap::new();
-            let unmatched: Vec<IpAddr> = all_seen_ips.difference(&all_matched_ips).copied().collect();
+            // Same candidate predicate the server and lookup_arin use:
+            // private/loopback addresses never become queries or cache entries.
+            let unmatched: Vec<IpAddr> = all_seen_ips
+                .difference(&all_matched_ips)
+                .copied()
+                .filter(|ip| is_arin_candidate(ip))
+                .collect();
 
             if let Some(db) = &self.asn_db {
                 // Offline path: instant O(log n) lookup, zero network calls.
                 for ip in &unmatched {
                     if let Some(r) = db.lookup(ip) {
-                        arin_results.insert(ip.to_string(), ArinResult {
+                        arin_results.insert(arin_key(ip), ArinResult {
                             handle: format!("AS{}", r.asn),
                             org_name: r.org_name.clone(),
                             cidr: String::new(),
@@ -319,14 +333,28 @@ impl ConnectionParser {
                 println!("✓ ASN DB: {} results for {} unmatched IPs", arin_results.len(), unmatched.len());
             } else if self.opts.arin_lookup {
                 // Online path: load disk cache, query only misses, persist results.
-                let mut cache: HashMap<String, Option<ArinResult>> = self.opts.arin_cache
-                    .as_deref()
-                    .and_then(|p| std::fs::read_to_string(p).ok())
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_default();
+                let mut cache: HashMap<String, Option<ArinResult>> = HashMap::new();
+                if let Some(cache_path) = &self.opts.arin_cache {
+                    let load = load_arin_cache(cache_path);
+                    if load.corrupt {
+                        // Recovery evidence: keep the corrupt file for
+                        // inspection and heal the cache from what survived.
+                        eprintln!(
+                            "Warning: ARIN cache {} was corrupt; recovered {} entries (original saved to {}.corrupt)",
+                            cache_path, load.recovered, cache_path
+                        );
+                        let _ = std::fs::rename(cache_path, format!("{}.corrupt", cache_path));
+                        if let Err(e) = persist_arin_cache(cache_path, &load.entries) {
+                            eprintln!("Warning: failed to rewrite recovered ARIN cache to {}: {}", cache_path, e);
+                        }
+                    } else if !load.entries.is_empty() {
+                        println!("✓ Loaded {} cached ARIN entries from {}", load.entries.len(), cache_path);
+                    }
+                    cache = load.entries;
+                }
 
                 let to_query: Vec<IpAddr> = unmatched.iter()
-                    .filter(|ip| !cache.contains_key(&ip.to_string()))
+                    .filter(|ip| !cache.contains_key(&arin_key(ip)))
                     .copied()
                     .collect();
 
@@ -337,21 +365,32 @@ impl ConnectionParser {
                         set.spawn(async move { (ip, lookup_arin(&ip).await) });
                     }
                     while let Some(res) = set.join_next().await {
-                        if let Ok((ip, Ok(arin))) = res {
-                            cache.insert(ip.to_string(), arin);
+                        match res {
+                            Ok((ip, Ok(arin))) => {
+                                cache.insert(arin_key(&ip), arin);
+                            }
+                            Ok((ip, Err(e))) => {
+                                // Negative-cache failures too — otherwise every
+                                // restart re-queries the same failing addresses
+                                // as if the cache were empty.
+                                eprintln!("ARIN: lookup for {} failed ({}); caching negative result", ip, e);
+                                cache.insert(arin_key(&ip), None);
+                            }
+                            Err(e) => {
+                                eprintln!("ARIN: lookup task failed: {}", e);
+                            }
                         }
                     }
                     if let Some(cache_path) = &self.opts.arin_cache {
-                        let json = serde_json::to_string_pretty(&cache).unwrap_or_default();
-                        if let Err(e) = std::fs::write(cache_path, json) {
+                        if let Err(e) = persist_arin_cache(cache_path, &cache) {
                             eprintln!("Warning: failed to persist ARIN cache to {}: {}", cache_path, e);
                         }
                     }
                 }
 
                 for ip in &unmatched {
-                    if let Some(Some(result)) = cache.get(&ip.to_string()) {
-                        arin_results.insert(ip.to_string(), result.clone());
+                    if let Some(Some(result)) = cache.get(&arin_key(ip)) {
+                        arin_results.insert(arin_key(ip), result.clone());
                     }
                 }
                 println!("✓ ARIN lookups complete: {} results", arin_results.len());

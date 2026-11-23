@@ -31,6 +31,172 @@ pub struct ArinResult {
     pub country: Option<String>,
 }
 
+/// Canonical identity for an IP address.
+///
+/// IPv4-mapped IPv6 addresses (`::ffff:1.2.3.4`) are the same endpoint as
+/// their plain IPv4 form, so they share one identity.
+pub fn canonical_ip(ip: &IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(*ip),
+        _ => *ip,
+    }
+}
+
+/// The single key used for an address everywhere: ARIN queries, cache
+/// entries, cache recovery and reports all key on this string, so one
+/// address can never end up with two different identities.
+pub fn arin_key(ip: &IpAddr) -> String {
+    canonical_ip(ip).to_string()
+}
+
+/// Whether ARIN could possibly hold a record for this address.
+///
+/// Private, loopback, link-local and unspecified addresses are never
+/// queried and never cached.  This one predicate is shared by
+/// [`lookup_arin`], the parser and the server so all three agree on
+/// which addresses are lookup candidates.
+pub fn is_arin_candidate(ip: &IpAddr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() {
+        return false;
+    }
+    if let IpAddr::V4(v4) = ip {
+        if v4.is_private() || v4.is_link_local() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Outcome of loading the persisted ARIN cache.
+pub struct ArinCacheLoad {
+    /// Cache entries keyed by [`arin_key`].  Empty when no cache file exists.
+    pub entries: HashMap<String, Option<ArinResult>>,
+    /// Number of entries salvaged from a corrupt cache file
+    /// (0 when the file was clean or missing).
+    pub recovered: usize,
+    /// True when the file existed but did not parse as a whole cache.
+    pub corrupt: bool,
+}
+
+/// Load the persisted ARIN cache, recovering whatever is salvageable.
+///
+/// A healthy cache — including caches written by older gibson versions —
+/// parses directly.  A corrupt cache (e.g. truncated by a crash mid-write)
+/// is salvaged entry-by-entry so a restart does not fall back to
+/// re-querying every address as if the cache were empty.
+pub fn load_arin_cache(path: &str) -> ArinCacheLoad {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => {
+            return ArinCacheLoad {
+                entries: HashMap::new(),
+                recovered: 0,
+                corrupt: false,
+            };
+        }
+    };
+
+    // Fast path: well-formed cache (this is also the old on-disk format,
+    // so caches and reports from previous runs keep working).
+    if let Ok(map) = serde_json::from_str::<HashMap<String, Option<ArinResult>>>(&content) {
+        return ArinCacheLoad {
+            entries: normalize_cache_keys(map),
+            recovered: 0,
+            corrupt: false,
+        };
+    }
+
+    // Recovery path: keep every entry that still parses.
+    let entries = salvage_arin_cache(&content);
+    ArinCacheLoad {
+        recovered: entries.len(),
+        corrupt: true,
+        entries,
+    }
+}
+
+/// Persist the ARIN cache atomically.
+///
+/// The cache is written to a sibling temp file and renamed over the target,
+/// so a crash or kill mid-write can never leave half a cache behind.
+pub fn persist_arin_cache(
+    path: &str,
+    cache: &HashMap<String, Option<ArinResult>>,
+) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(cache).map_err(std::io::Error::other)?;
+    let tmp_path = format!("{}.tmp", path);
+    std::fs::write(&tmp_path, json)?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+/// Re-key cache entries through [`arin_key`] so recovered entries share the
+/// same address identity as fresh lookups.  On key collision a positive
+/// result wins over a negative one.
+fn normalize_cache_keys(
+    map: HashMap<String, Option<ArinResult>>,
+) -> HashMap<String, Option<ArinResult>> {
+    let mut out: HashMap<String, Option<ArinResult>> = HashMap::with_capacity(map.len());
+    for (key, value) in map {
+        let key = match key.parse::<IpAddr>() {
+            Ok(ip) => arin_key(&ip),
+            Err(_) => key, // not an address literal — keep as-is
+        };
+        match out.entry(key) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(value);
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if e.get().is_none() && value.is_some() {
+                    e.insert(value);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Best-effort recovery of cache entries from a corrupt cache file.
+fn salvage_arin_cache(content: &str) -> HashMap<String, Option<ArinResult>> {
+    // Case 1: valid JSON with an unexpected shape — keep the entries that
+    // still deserialize (e.g. a cache written by a different version).
+    if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(content) {
+        let salvaged: HashMap<String, Option<ArinResult>> = obj
+            .into_iter()
+            .filter_map(|(k, v)| {
+                serde_json::from_value::<Option<ArinResult>>(v)
+                    .ok()
+                    .map(|r| (k, r))
+            })
+            .collect();
+        return normalize_cache_keys(salvaged);
+    }
+
+    // Case 2: truncated or trailing-garbage JSON (e.g. half a cache left
+    // behind by a crash).  Re-try successively shorter prefixes cut at entry
+    // boundaries — the last complete entry may end in '}' *or* in a scalar
+    // (`null`, a string), so both '}' and ',' are candidate cut points.
+    let mut cuts: Vec<usize> = content
+        .match_indices(|c| c == '}' || c == ',')
+        .map(|(i, _)| i)
+        .collect();
+    cuts.sort_unstable_by(|a, b| b.cmp(a)); // longest prefix first
+    cuts.dedup();
+    for i in cuts.into_iter().take(128) {
+        for candidate in [
+            content[..=i].to_string(),                 // boundary char included
+            format!("{}}}", content[..i].trim_end()),  // tail dropped, object closed
+        ] {
+            if let Ok(map) = serde_json::from_str::<HashMap<String, Option<ArinResult>>>(&candidate)
+            {
+                return normalize_cache_keys(map);
+            }
+        }
+    }
+
+    HashMap::new()
+}
+
 // Internal structs used only for deserialising the Microsoft Service Tags JSON.
 #[derive(Deserialize)]
 struct ServiceTagsRoot {
@@ -406,13 +572,8 @@ impl CloudDetector {
 /// for non-ARIN-managed IPs.  Private / loopback addresses are not queried.
 pub async fn lookup_arin(ip: &IpAddr) -> anyhow::Result<Option<ArinResult>> {
     // Skip RFC 1918 and loopback — ARIN has no records for these.
-    if ip.is_loopback() || ip.is_unspecified() {
+    if !is_arin_candidate(ip) {
         return Ok(None);
-    }
-    if let IpAddr::V4(v4) = ip {
-        if v4.is_private() || v4.is_link_local() {
-            return Ok(None);
-        }
     }
 
     let url = format!("https://rdap.arin.net/bootstrap/ip/{}", ip);
@@ -464,15 +625,25 @@ pub async fn lookup_arin(ip: &IpAddr) -> anyhow::Result<Option<ArinResult>> {
 fn extract_rdap_org_name(v: &serde_json::Value) -> Option<String> {
     let entities = v["entities"].as_array()?;
     for entity in entities {
-        let roles = entity["roles"].as_array()?;
+        // A malformed entity must not discard the registrant listed in a
+        // later entity — skip it instead of abandoning the whole response.
+        let roles = match entity["roles"].as_array() {
+            Some(roles) => roles,
+            None => continue,
+        };
         let is_registrant = roles.iter().any(|r| r.as_str() == Some("registrant"));
         if !is_registrant {
             continue;
         }
-        let fields = entity["vcardArray"][1].as_array()?;
+        let fields = match entity["vcardArray"][1].as_array() {
+            Some(fields) => fields,
+            None => continue,
+        };
         for field in fields {
             if field[0].as_str() == Some("fn") {
-                return field[3].as_str().map(|s| s.to_string());
+                if let Some(name) = field[3].as_str() {
+                    return Some(name.to_string());
+                }
             }
         }
     }
@@ -534,5 +705,124 @@ impl FirewallRule {
                 String::new()
             }
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn sample_result() -> ArinResult {
+        ArinResult {
+            handle: "EXAMPLE-1".to_string(),
+            org_name: "Example Org".to_string(),
+            cidr: "203.0.113.0/24".to_string(),
+            country: Some("US".to_string()),
+        }
+    }
+
+    fn temp_cache_path(tag: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("gibson-arin-cache-{}-{}.json", tag, std::process::id()))
+            .to_string_lossy()
+            .to_string()
+    }
+
+    #[test]
+    fn canonical_identity_unifies_mapped_v6() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        let mapped = IpAddr::V6("::ffff:8.8.8.8".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(canonical_ip(&mapped), v4);
+        assert_eq!(arin_key(&mapped), arin_key(&v4));
+        assert_eq!(arin_key(&v4), "8.8.8.8");
+    }
+
+    #[test]
+    fn arin_candidate_predicate_matches_lookup_rules() {
+        assert!(!is_arin_candidate(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(!is_arin_candidate(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+        assert!(!is_arin_candidate(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
+        assert!(!is_arin_candidate(&IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))));
+        assert!(!is_arin_candidate(&IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))));
+        assert!(is_arin_candidate(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+    }
+
+    #[test]
+    fn cache_round_trip_preserves_negative_entries() {
+        let path = temp_cache_path("roundtrip");
+
+        let mut cache = HashMap::new();
+        cache.insert("203.0.113.1".to_string(), Some(sample_result()));
+        cache.insert("198.51.100.1".to_string(), None); // negative entry
+        persist_arin_cache(&path, &cache).unwrap();
+
+        let load = load_arin_cache(&path);
+        assert!(!load.corrupt);
+        assert_eq!(load.recovered, 0);
+        assert_eq!(load.entries.len(), 2);
+        assert!(load.entries["198.51.100.1"].is_none());
+        assert_eq!(
+            load.entries["203.0.113.1"].as_ref().unwrap().org_name,
+            "Example Org"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn corrupt_cache_is_salvaged_not_discarded() {
+        let path = temp_cache_path("corrupt");
+
+        // Half a cache, as left behind by a crash mid-write: two complete
+        // entries (one positive, one negative) plus a truncated third.
+        let half = "{\n  \"203.0.113.1\": {\n    \"handle\": \"EXAMPLE-1\",\n    \"org_name\": \"Example Org\",\n    \"cidr\": \"203.0.113.0/24\",\n    \"country\": \"US\"\n  },\n  \"198.51.100.1\": null,\n  \"192.0.2.1\": {\n    \"handle\": \"TR";
+        std::fs::write(&path, half).unwrap();
+
+        let load = load_arin_cache(&path);
+        assert!(load.corrupt);
+        assert_eq!(load.recovered, 2);
+        assert_eq!(
+            load.entries["203.0.113.1"].as_ref().unwrap().org_name,
+            "Example Org"
+        );
+        assert!(load.entries["198.51.100.1"].is_none());
+        assert!(!load.entries.contains_key("192.0.2.1")); // truncated entry dropped
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn old_cache_entries_without_country_still_load() {
+        let path = temp_cache_path("oldformat");
+        let json = r#"{"203.0.113.1": {"handle": "EXAMPLE-1", "org_name": "Example Org", "cidr": "203.0.113.0/24"}}"#;
+        std::fs::write(&path, json).unwrap();
+
+        let load = load_arin_cache(&path);
+        assert!(!load.corrupt);
+        let entry = load.entries["203.0.113.1"].as_ref().unwrap();
+        assert_eq!(entry.org_name, "Example Org");
+        assert_eq!(entry.country, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn org_name_survives_malformed_entities() {
+        // The first entity has no roles array — it must be skipped, not
+        // abort the walk and orphan the registrant in the second entity.
+        let v = serde_json::json!({
+            "entities": [
+                { "handle": "ABUSE-1" },
+                {
+                    "roles": ["registrant"],
+                    "vcardArray": ["vcard", [
+                        ["version", {}, "text", "4.0"],
+                        ["fn", {}, "text", "Example Org"]
+                    ]]
+                }
+            ]
+        });
+        assert_eq!(extract_rdap_org_name(&v), Some("Example Org".to_string()));
     }
 }

@@ -12,7 +12,10 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use crate::asn_db::AsnDb;
-use crate::cloud_detector::{lookup_arin, ArinResult, CloudDetector};
+use crate::cloud_detector::{
+    arin_key, canonical_ip, is_arin_candidate, load_arin_cache, lookup_arin, persist_arin_cache,
+    ArinResult, CloudDetector,
+};
 use crate::collector_v2::{ConnectionRecord, UploadBatch};
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
@@ -226,10 +229,20 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     // Load persisted ARIN cache from disk if available.
     let arin_cache_initial: HashMap<String, Option<ArinResult>> =
         if let Some(path) = &opts.arin_cache {
-            match std::fs::read_to_string(path) {
-                Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
-                Err(_) => HashMap::new(),
+            let load = load_arin_cache(path);
+            if load.corrupt {
+                // Recovery evidence: keep the corrupt file for inspection
+                // and heal the cache from the entries that survived.
+                eprintln!(
+                    "Warning: ARIN cache {} was corrupt; recovered {} entries (original saved to {}.corrupt)",
+                    path, load.recovered, path
+                );
+                let _ = std::fs::rename(path, format!("{}.corrupt", path));
+                if let Err(e) = persist_arin_cache(path, &load.entries) {
+                    eprintln!("Warning: failed to rewrite recovered ARIN cache to {}: {}", path, e);
+                }
             }
+            load.entries
         } else {
             HashMap::new()
         };
@@ -432,14 +445,22 @@ async fn handle_cross_machine(
 
         for session in sessions.values() {
             for r in &session.records {
+                // Key every map by the canonical address identity so the
+                // report lines up with cache entries and arin_results —
+                // different spellings of one address (or an unparseable
+                // value) must not fragment or poison attribution.
+                let ip_key = match r.remote_ip.parse::<IpAddr>() {
+                    Ok(ip) => arin_key(&ip),
+                    Err(_) => continue,
+                };
                 ip_to_machines
-                    .entry(r.remote_ip.clone())
+                    .entry(ip_key.clone())
                     .or_default()
                     .insert(session.hostname.clone());
                 ip_to_host
-                    .entry(r.remote_ip.clone())
+                    .entry(ip_key.clone())
                     .or_insert_with(|| r.remote_hostname.clone());
-                *ip_conn_count.entry(r.remote_ip.clone()).or_insert(0) += 1;
+                *ip_conn_count.entry(ip_key).or_insert(0) += 1;
             }
         }
 
@@ -520,16 +541,11 @@ fn collect_unmatched_ips(records: &[ConnectionRecord], detector: &CloudDetector)
 
     for r in records {
         let ip: IpAddr = match r.remote_ip.parse() {
-            Ok(a) => a,
+            Ok(a) => canonical_ip(&a),
             Err(_) => continue,
         };
-        if ip.is_loopback() || ip.is_unspecified() {
+        if !is_arin_candidate(&ip) {
             continue;
-        }
-        if let IpAddr::V4(v4) = ip {
-            if v4.is_private() || v4.is_link_local() {
-                continue;
-            }
         }
         seen.insert(ip);
         if detector.detect(&ip, r.remote_hostname.as_deref()).is_some() {
@@ -559,7 +575,7 @@ async fn resolve_ip_ownership(
             .filter_map(|ip| {
                 db.lookup(ip).map(|r| {
                     (
-                        ip.to_string(),
+                        arin_key(ip),
                         ArinResult {
                             handle: format!("AS{}", r.asn),
                             org_name: r.org_name.clone(),
@@ -576,7 +592,7 @@ async fn resolve_ip_ownership(
     let to_lookup: Vec<IpAddr> = {
         let guard = cache.lock().unwrap();
         ips.iter()
-            .filter(|ip| !guard.contains_key(&ip.to_string()))
+            .filter(|ip| !guard.contains_key(&arin_key(ip)))
             .copied()
             .collect()
     };
@@ -591,8 +607,20 @@ async fn resolve_ip_ownership(
 
         let mut updates: Vec<(String, Option<ArinResult>)> = Vec::new();
         while let Some(result) = set.join_next().await {
-            if let Ok((ip, Ok(arin))) = result {
-                updates.push((ip.to_string(), arin));
+            match result {
+                Ok((ip, Ok(arin))) => {
+                    updates.push((arin_key(&ip), arin));
+                }
+                Ok((ip, Err(e))) => {
+                    // Negative-cache failures too — otherwise every restart
+                    // re-queries the same failing addresses as if the cache
+                    // were empty.
+                    eprintln!("ARIN: lookup for {} failed ({}); caching negative result", ip, e);
+                    updates.push((arin_key(&ip), None));
+                }
+                Err(e) => {
+                    eprintln!("ARIN: lookup task failed: {}", e);
+                }
             }
         }
 
@@ -604,8 +632,7 @@ async fn resolve_ip_ownership(
         }
 
         if let Some(path) = cache_path {
-            let json = serde_json::to_string_pretty(&*guard).unwrap_or_default();
-            if let Err(e) = std::fs::write(path, json) {
+            if let Err(e) = persist_arin_cache(path, &*guard) {
                 eprintln!("Warning: failed to persist ARIN cache to {}: {}", path, e);
             }
         }
@@ -615,9 +642,9 @@ async fn resolve_ip_ownership(
     ips.iter()
         .filter_map(|ip| {
             guard
-                .get(&ip.to_string())
+                .get(&arin_key(ip))
                 .and_then(|r| r.as_ref())
-                .map(|r| (ip.to_string(), r.clone()))
+                .map(|r| (arin_key(ip), r.clone()))
         })
         .collect()
 }
