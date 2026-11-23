@@ -182,6 +182,22 @@ curl -O https://iptoasn.com/data/ip2asn-v4.tsv.gz && gunzip ip2asn-v4.tsv.gz
 
 When `--asn-db` is provided, `--arin-lookup` is ignored. Use `--arin-cache` to persist ARIN results to disk so re-runs skip already-queried IPs.
 
+### Aggregation Server Identity Model
+
+The `serve` command correlates uploads by **canonical identity**, not raw strings:
+
+| Field | Canonical identity | Effect |
+|---|---|---|
+| Machine hostname | Lowercased, trailing root dot stripped | `WebServer`, `WEBSERVER.`, and `webserver` accumulate into one session; `web-01` and `web-01.corp.example` never merge |
+| Remote address | Parsed IP, IPv4-mapped IPv6 folded to IPv4 | `::ffff:203.0.113.7` and `203.0.113.7` are one shared address; mapped private addresses stay private |
+| Ownership | IP ranges first, domain name as fallback | A forged PTR record cannot re-attribute an address that belongs to a known provider range |
+
+This keeps cross-machine shared-IP sets (`GET /api/patterns`) and per-machine
+summaries (`GET /api/sessions`) stable when a host is renamed between uploads
+or reports the same endpoint in different textual forms. Normalisation is
+deliberately exact — no fuzzy matching — so lookalike names cannot hijack
+another machine's session.
+
 ### Cloud Provider Analysis
 
 ```bash

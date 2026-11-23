@@ -278,7 +278,10 @@ impl CloudDetector {
     }
 
     pub fn detect_by_domain(&self, domain: &str) -> Option<CloudDetection> {
-        let domain_lower = domain.to_lowercase();
+        // Canonicalise first: PTR answers are case-insensitive and often
+        // carry the root dot ("ec2-….amazonaws.com."), which would otherwise
+        // silently defeat the suffix match.
+        let domain_lower = crate::identity::canonical_dns_name(domain);
 
         for (provider, patterns) in &self.domain_patterns {
             for pattern in patterns {
@@ -299,16 +302,25 @@ impl CloudDetector {
         None
     }
 
+    /// Identify the owner of a connection endpoint.
+    ///
+    /// The address itself is the ownership identity: IP-range ownership
+    /// (Service Tags, then hardcoded ranges) is checked first because a
+    /// reverse-DNS name can be forged to impersonate a provider, while the
+    /// endpoint actually connected to cannot.  The domain is only consulted
+    /// when the address falls outside every known range — providers like
+    /// Fastly, GitHub, and Microsoft publish no IP ranges here and can only
+    /// be recognised by name.
     pub fn detect(&self, ip: &IpAddr, domain: Option<&str>) -> Option<CloudDetection> {
+        if let Some(mut detection) = self.detect_by_ip(ip) {
+            detection.domain = domain.map(|d| d.to_string());
+            return Some(detection);
+        }
         if let Some(domain) = domain {
             if let Some(mut detection) = self.detect_by_domain(domain) {
                 detection.ip = *ip;
                 return Some(detection);
             }
-        }
-        if let Some(mut detection) = self.detect_by_ip(ip) {
-            detection.domain = domain.map(|d| d.to_string());
-            return Some(detection);
         }
         None
     }
@@ -405,17 +417,16 @@ impl CloudDetector {
 /// ARIN automatically routes to the correct RIR (RIPE, APNIC, LACNIC, AFRINIC)
 /// for non-ARIN-managed IPs.  Private / loopback addresses are not queried.
 pub async fn lookup_arin(ip: &IpAddr) -> anyhow::Result<Option<ArinResult>> {
-    // Skip RFC 1918 and loopback — ARIN has no records for these.
-    if ip.is_loopback() || ip.is_unspecified() {
+    // Skip non-public addresses — ARIN has no records for these.  Checked on
+    // the canonical address so IPv4-mapped private addresses are excluded too.
+    if crate::identity::is_non_public(ip) {
         return Ok(None);
     }
-    if let IpAddr::V4(v4) = ip {
-        if v4.is_private() || v4.is_link_local() {
-            return Ok(None);
-        }
-    }
 
-    let url = format!("https://rdap.arin.net/bootstrap/ip/{}", ip);
+    let url = format!(
+        "https://rdap.arin.net/bootstrap/ip/{}",
+        crate::identity::canonical_addr(*ip)
+    );
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
@@ -486,6 +497,45 @@ pub struct ProviderSummary {
     pub unique_domains: Vec<String>,
     pub services: HashMap<String, usize>,
     pub total_connections: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ip_ownership_wins_over_forged_domain() {
+        let d = CloudDetector::new();
+        // 54.1.2.3 sits inside the hardcoded AWS range while the (forged)
+        // PTR name claims Cloudflare — the address is the identity.
+        let det = d
+            .detect(&"54.1.2.3".parse().unwrap(), Some("evil.cloudflare.com"))
+            .unwrap();
+        assert_eq!(det.provider.name, "AWS");
+    }
+
+    #[test]
+    fn domain_is_fallback_when_ip_is_unknown() {
+        let d = CloudDetector::new();
+        let unknown: IpAddr = "203.0.113.7".parse().unwrap();
+        // Providers without published IP ranges are still recognised by name.
+        let det = d.detect(&unknown, Some("cdn.fastly.net")).unwrap();
+        assert_eq!(det.provider.name, "Fastly");
+        // Root-dot FQDN and mixed case still match after canonicalisation.
+        let det = d
+            .detect(&unknown, Some("Ec2-1-2-3-4.Compute-1.AmazonAWS.com."))
+            .unwrap();
+        assert_eq!(det.provider.name, "AWS");
+        // Unknown address with no name → no detection.
+        assert!(d.detect(&unknown, None).is_none());
+    }
+
+    #[test]
+    fn known_cloud_addresses_still_detect_by_ip() {
+        let d = CloudDetector::new();
+        let det = d.detect(&"104.16.8.8".parse().unwrap(), None).unwrap();
+        assert_eq!(det.provider.name, "Cloudflare");
+    }
 }
 
 #[derive(Debug, Serialize)]

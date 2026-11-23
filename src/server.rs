@@ -14,6 +14,7 @@ use std::time::SystemTime;
 use crate::asn_db::AsnDb;
 use crate::cloud_detector::{lookup_arin, ArinResult, CloudDetector};
 use crate::collector_v2::{ConnectionRecord, UploadBatch};
+use crate::identity::{canonical_host_key, canonical_ip, canonical_ip_key, is_non_public};
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -50,6 +51,9 @@ pub struct ServerOpts {
 
 struct Session {
     id: String,
+    /// Display name — the most recently reported hostname.  The map key is
+    /// the canonical host identity, so renames that only change case or a
+    /// trailing dot update this field instead of splitting the session.
     hostname: String,
     first_seen_unix: u64,
     last_seen_unix: u64,
@@ -80,7 +84,9 @@ fn unix_now() -> u64 {
 
 #[derive(Clone)]
 struct AppState {
-    // Keyed by hostname so batches from the same machine accumulate.
+    // Keyed by canonical host identity (see identity::canonical_host_key) so
+    // batches from the same machine accumulate across hostname case/dot
+    // drift, while genuinely different names never merge.
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     cloud_detector: Arc<CloudDetector>,
     api_key: Option<String>,
@@ -331,6 +337,7 @@ async fn handle_upload(
         serde_json::from_str(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let hostname = batch.hostname.clone();
+    let host_key = canonical_host_key(&hostname);
     let incoming_count = batch.records.len();
     let session_id;
     let total_for_machine;
@@ -338,9 +345,12 @@ async fn handle_upload(
     {
         let mut sessions = state.sessions.lock().unwrap();
         let session = sessions
-            .entry(hostname.clone())
+            .entry(host_key)
             .or_insert_with(|| Session::new(hostname.clone(), Vec::new()));
 
+        // Track the most recent presentation of the name; the identity
+        // (map key) already stayed the same across the rename.
+        session.hostname = hostname.clone();
         session.records.extend(batch.records);
         session.last_seen_unix = unix_now();
         session_id = session.id.clone();
@@ -389,7 +399,11 @@ async fn handle_get_session(
     // then release it before doing any async work.
     let (summary, patterns, unmatched) = {
         let sessions = state.sessions.lock().unwrap();
-        let session = sessions.get(&hostname).ok_or(StatusCode::NOT_FOUND)?;
+        // Look up by canonical identity so any case/dot variant of the
+        // machine's name resolves to the same session.
+        let session = sessions
+            .get(&canonical_host_key(&hostname))
+            .ok_or(StatusCode::NOT_FOUND)?;
         let patterns = analyze_patterns(&session.records, &state.cloud_detector);
         let unmatched = collect_unmatched_ips(&session.records, &state.cloud_detector);
         let summary = SessionSummary {
@@ -426,20 +440,24 @@ async fn handle_cross_machine(
     let (shared_ips, by_machine, all_unmatched) = {
         let sessions = state.sessions.lock().unwrap();
 
+        // Shared-IP grouping keys on the canonical address identity, and each
+        // machine is its canonical host identity — so `::ffff:1.2.3.4` and
+        // `1.2.3.4` are one shared address, and a renamed host is one machine.
         let mut ip_to_machines: HashMap<String, HashSet<String>> = HashMap::new();
         let mut ip_to_host: HashMap<String, Option<String>> = HashMap::new();
         let mut ip_conn_count: HashMap<String, usize> = HashMap::new();
 
-        for session in sessions.values() {
+        for (host_key, session) in sessions.iter() {
             for r in &session.records {
+                let ip_key = canonical_ip_key(&r.remote_ip);
                 ip_to_machines
-                    .entry(r.remote_ip.clone())
+                    .entry(ip_key.clone())
                     .or_default()
-                    .insert(session.hostname.clone());
+                    .insert(host_key.clone());
                 ip_to_host
-                    .entry(r.remote_ip.clone())
+                    .entry(ip_key.clone())
                     .or_insert_with(|| r.remote_hostname.clone());
-                *ip_conn_count.entry(r.remote_ip.clone()).or_insert(0) += 1;
+                *ip_conn_count.entry(ip_key).or_insert(0) += 1;
             }
         }
 
@@ -454,9 +472,21 @@ async fn handle_cross_machine(
                         state.cloud_detector.detect(&a, host)
                     })
                     .is_some();
+                // Report display names, but the sharing decision above was
+                // made on canonical identities.
+                let mut seen_on: Vec<String> = machines
+                    .iter()
+                    .map(|key| {
+                        sessions
+                            .get(key)
+                            .map(|s| s.hostname.clone())
+                            .unwrap_or_else(|| key.clone())
+                    })
+                    .collect();
+                seen_on.sort();
                 SharedIp {
                     remote_host: ip_to_host.get(&ip).and_then(|h| h.clone()),
-                    seen_on: machines.into_iter().collect(),
+                    seen_on,
                     total_connections: *ip_conn_count.get(&ip).unwrap_or(&0),
                     is_known_cloud,
                     remote_ip: ip,
@@ -471,7 +501,7 @@ async fn handle_cross_machine(
                 .then(b.total_connections.cmp(&a.total_connections))
         });
 
-        let by_machine: Vec<MachineSummary> = sessions
+        let mut by_machine: Vec<MachineSummary> = sessions
             .values()
             .map(|s| {
                 let p = analyze_patterns(&s.records, &state.cloud_detector);
@@ -484,6 +514,7 @@ async fn handle_cross_machine(
                 }
             })
             .collect();
+        by_machine.sort_by(|a, b| a.hostname.cmp(&b.hostname));
 
         // Aggregate unmatched IPs across all sessions.
         let all_unmatched: Vec<IpAddr> = sessions
@@ -519,17 +550,14 @@ fn collect_unmatched_ips(records: &[ConnectionRecord], detector: &CloudDetector)
     let mut matched: HashSet<IpAddr> = HashSet::new();
 
     for r in records {
-        let ip: IpAddr = match r.remote_ip.parse() {
-            Ok(a) => a,
-            Err(_) => continue,
+        // Canonical identity: `::ffff:203.0.113.7` and `203.0.113.7` are the
+        // same endpoint, and a mapped *private* address is still private.
+        let ip: IpAddr = match canonical_ip(&r.remote_ip) {
+            Some(a) => a,
+            None => continue,
         };
-        if ip.is_loopback() || ip.is_unspecified() {
+        if is_non_public(&ip) {
             continue;
-        }
-        if let IpAddr::V4(v4) = ip {
-            if v4.is_private() || v4.is_link_local() {
-                continue;
-            }
         }
         seen.insert(ip);
         if detector.detect(&ip, r.remote_hostname.as_deref()).is_some() {
@@ -656,7 +684,10 @@ fn detect_beaconing(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
-        let key = (r.process_name.clone(), r.remote_ip.clone());
+        // Group by canonical address identity so the same endpoint reported
+        // as `1.2.3.4` on one poll and `::ffff:1.2.3.4` on another still
+        // forms a single timing series.
+        let key = (r.process_name.clone(), canonical_ip_key(&r.remote_ip));
         let entry = groups
             .entry(key)
             .or_insert_with(|| (Vec::new(), r.remote_hostname.clone()));
@@ -845,7 +876,7 @@ fn detect_port_anomalies(records: &[ConnectionRecord]) -> Vec<PortAnomaly> {
             Some(p) if !STANDARD_PORTS.contains(&p) && p > 0 => p,
             _ => continue,
         };
-        let key = (port, r.process_name.clone(), r.remote_ip.clone());
+        let key = (port, r.process_name.clone(), canonical_ip_key(&r.remote_ip));
         let entry = groups
             .entry(key)
             .or_insert((0, r.remote_hostname.clone()));
@@ -879,17 +910,17 @@ fn detect_high_freq_noncloud(
     let mut groups: HashMap<(String, String), (usize, Option<String>)> = HashMap::new();
 
     for r in records {
-        let ip: IpAddr = match r.remote_ip.parse() {
-            Ok(a) => a,
-            Err(_) => continue,
+        let ip: IpAddr = match canonical_ip(&r.remote_ip) {
+            Some(a) => a,
+            None => continue,
         };
         if detector.detect(&ip, r.remote_hostname.as_deref()).is_some() {
             continue; // known cloud provider — expected
         }
-        if ip.is_private() {
-            continue; // skip RFC 1918 / internal
+        if is_non_public(&ip) {
+            continue; // skip RFC 1918 / ULA / loopback / link-local — internal
         }
-        let key = (r.process_name.clone(), r.remote_ip.clone());
+        let key = (r.process_name.clone(), ip.to_string());
         let entry = groups
             .entry(key)
             .or_insert((0, r.remote_hostname.clone()));
@@ -912,17 +943,195 @@ fn detect_high_freq_noncloud(
     findings
 }
 
-// ─── IpAddr::is_private helper (stable in 1.75+) ─────────────────────────────
+// ─── tests ────────────────────────────────────────────────────────────────────
 
-trait IsPrivate {
-    fn is_private(&self) -> bool;
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl IsPrivate for IpAddr {
-    fn is_private(&self) -> bool {
-        match self {
-            IpAddr::V4(a) => a.is_private() || a.is_link_local(),
-            IpAddr::V6(a) => a.is_loopback(),
+    fn test_state() -> AppState {
+        AppState {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            cloud_detector: Arc::new(CloudDetector::new()),
+            api_key: None,
+            arin_cache: Arc::new(Mutex::new(HashMap::new())),
+            arin_cache_path: None,
+            asn_db: None,
         }
+    }
+
+    fn record(ip: &str, host: Option<&str>) -> ConnectionRecord {
+        ConnectionRecord {
+            timestamp: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            pid: 42,
+            process_name: "testproc".to_string(),
+            protocol: "TCP".to_string(),
+            local_addr: "10.0.0.5".to_string(),
+            local_port: Some(5000),
+            remote_addr: format!("{}:443", ip),
+            remote_port: Some(443),
+            remote_ip: ip.to_string(),
+            remote_hostname: host.map(|h| h.to_string()),
+            state: Some("Established".to_string()),
+            ppid: None,
+            command_line: None,
+        }
+    }
+
+    fn batch(hostname: &str, records: Vec<ConnectionRecord>) -> String {
+        let batch = UploadBatch {
+            hostname: hostname.to_string(),
+            batch_id: format!("{}_1", hostname),
+            timestamp: SystemTime::now(),
+            records,
+            metadata: None,
+        };
+        serde_json::to_string(&batch).unwrap()
+    }
+
+    /// Alternate uploads from a host whose reported name keeps changing
+    /// (case / trailing root dot), mixed with IPv4-mapped forms of the same
+    /// endpoints: the shared sets and summaries must still resolve to one
+    /// machine identity and one address identity.
+    #[tokio::test]
+    async fn alternating_renamed_uploads_share_one_identity() {
+        let state = test_state();
+
+        // Machine 1 alternates its reported name across uploads; one record
+        // uses the IPv4-mapped form of the same private endpoint.
+        handle_upload(
+            State(state.clone()),
+            batch(
+                "WebServer",
+                vec![
+                    record("10.9.9.9", None),
+                    record("104.16.8.8", Some("cdn.cloudflare.com")),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+        handle_upload(
+            State(state.clone()),
+            batch("WEBSERVER.", vec![record("::ffff:10.9.9.9", None)]),
+        )
+        .await
+        .unwrap();
+        handle_upload(
+            State(state.clone()),
+            batch("webserver", vec![record("10.9.9.9", None)]),
+        )
+        .await
+        .unwrap();
+
+        // Machine 2 sees the same endpoints.
+        handle_upload(
+            State(state.clone()),
+            batch(
+                "db-01",
+                vec![record("10.9.9.9", None), record("104.16.8.8", None)],
+            ),
+        )
+        .await
+        .unwrap();
+
+        // Summaries: two machine identities, all records accumulated.
+        let Json(sessions) = handle_list_sessions(State(state.clone()), HeaderMap::new())
+            .await
+            .unwrap();
+        assert_eq!(sessions.len(), 2);
+        let total: usize = sessions.iter().map(|s| s.record_count).sum();
+        assert_eq!(total, 6);
+
+        // Shared sets: canonical address and host identities.
+        let Json(report) = handle_cross_machine(State(state.clone()), HeaderMap::new())
+            .await
+            .unwrap();
+        assert_eq!(report.by_machine.len(), 2);
+        assert_eq!(report.by_machine[0].hostname, "db-01");
+        // Latest presentation of the renamed host, one accumulated session.
+        assert_eq!(report.by_machine[1].hostname, "webserver");
+        assert_eq!(report.by_machine[1].record_count, 4);
+
+        // Only the two canonical addresses appear — no phantom "::ffff:" entry.
+        assert_eq!(report.shared_ips.len(), 2);
+
+        let private = report
+            .shared_ips
+            .iter()
+            .find(|s| s.remote_ip == "10.9.9.9")
+            .expect("IPv4-mapped and plain forms merge into one shared address");
+        assert_eq!(
+            private.seen_on,
+            vec!["db-01".to_string(), "webserver".to_string()]
+        );
+        assert_eq!(private.total_connections, 4);
+        assert!(!private.is_known_cloud);
+
+        // Cloud addresses still classify as known cloud.
+        let cloud = report
+            .shared_ips
+            .iter()
+            .find(|s| s.remote_ip == "104.16.8.8")
+            .expect("cloud shared address present");
+        assert!(cloud.is_known_cloud);
+        assert_eq!(cloud.total_connections, 2);
+    }
+
+    /// A session is reachable by any case/dot variant of its machine's name;
+    /// a lookalike name is a different identity.
+    #[tokio::test]
+    async fn session_lookup_accepts_any_name_variant() {
+        let state = test_state();
+        handle_upload(
+            State(state.clone()),
+            batch("WebServer", vec![record("104.16.8.8", None)]),
+        )
+        .await
+        .unwrap();
+
+        for variant in ["WebServer", "webserver", "WEBSERVER."] {
+            let Json(analysis) = handle_get_session(
+                State(state.clone()),
+                HeaderMap::new(),
+                Path(variant.to_string()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(analysis.session.record_count, 1);
+        }
+
+        // A forged lookalike must not resolve to the real machine's session.
+        let forged = handle_get_session(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("webserver.corp.example".to_string()),
+        )
+        .await;
+        assert!(forged.is_err());
+    }
+
+    /// Forged lookalike hostnames never merge into another machine's
+    /// identity — normalisation is exact, not fuzzy.
+    #[tokio::test]
+    async fn forged_lookalike_names_stay_separate() {
+        let state = test_state();
+        handle_upload(
+            State(state.clone()),
+            batch("web-01", vec![record("104.16.8.8", None)]),
+        )
+        .await
+        .unwrap();
+        handle_upload(
+            State(state.clone()),
+            batch("web-01.evil.example", vec![record("104.16.8.8", None)]),
+        )
+        .await
+        .unwrap();
+
+        let Json(sessions) = handle_list_sessions(State(state.clone()), HeaderMap::new())
+            .await
+            .unwrap();
+        assert_eq!(sessions.len(), 2);
     }
 }
